@@ -12,7 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 
-// 加入這兩個標頭檔
+// esp_camera串流及相機的設定標頭
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
@@ -179,12 +179,12 @@ void wifi_init_sta(void)
     }
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+        ESP_LOGE(TAG, "Failed to connect to SSID:%s, password:%s",
                  EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        // 連線失敗就等待 3 秒後重啟 ESP32
+        ESP_LOGE(TAG, "Wi-Fi 連線失敗，系統將於 3 秒後重啟...");
+        vTaskDelay(3000 / portTICK_PERIOD_MS); // FreeRTOS 的延遲寫法
+        esp_restart(); 
     }
 }
 
@@ -237,6 +237,122 @@ static esp_err_t init_camera(void)
     return ESP_OK;
 }
 
+// ===== MJPEG 串流格式定義 =====
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY; // [cite: 3]
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n"; // [cite: 4]
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"; // [cite: 4]
+
+// 宣告伺服器控制代碼 [cite: 5]
+httpd_handle_t stream_httpd = NULL;
+httpd_handle_t page_httpd = NULL;
+
+// ========== 串流處理：不斷擷取畫面並傳給客戶端 ==========
+static esp_err_t stream_handler(httpd_req_t *req) {
+    camera_fb_t *fb = NULL;
+    char part_buf[64];
+    esp_err_t res = ESP_OK;
+
+    // 設定 HTTP Response 標頭，告訴客戶端這是多段影像串流 [cite: 8]
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) return res;
+
+    // 無限迴圈：持續拍照 → 傳送 → 拍照 → 傳送... [cite: 9]
+    while (true) {
+        fb = esp_camera_fb_get(); // 從攝影機取得一幀 JPEG 圖片 [cite: 10]
+        if (!fb) {
+            ESP_LOGE(TAG, "相機擷取失敗");
+            res = ESP_FAIL; 
+            break; // 拍照失敗就跳出 [cite: 11]
+        }
+
+        // 1. 組裝該張圖片的 Header (包含大小)
+        size_t hlen = snprintf(part_buf, 64, _STREAM_PART, fb->len); // [cite: 11]
+        
+        // 2. 傳送分隔線
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY)); // [cite: 12]
+        // 3. 傳送圖片 Header
+        if (res == ESP_OK) res = httpd_resp_send_chunk(req, part_buf, hlen); // [cite: 12]
+        // 4. 傳送真正的 JPEG 圖片資料
+        if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len); // [cite: 13]
+        
+        // 釋放該幀記憶體，供相機模組下次使用 (非常重要，否則會 Memory Leak) [cite: 14]
+        esp_camera_fb_return(fb);
+
+        // FreeRTOS delay10ms, CPU自動釋放資源
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // 如果中途傳送失敗（例如前端 App 或瀏覽器關閉連線），就停止這個迴圈 [cite: 15]
+        if (res != ESP_OK) break;
+    }
+    return res;
+}
+
+// ========== 首頁：顯示標題和嵌入串流畫面 ==========
+static esp_err_t index_handler(httpd_req_t *req) {
+    // 將 HTML 轉換為純 C 字串陣列
+    const char html[] = 
+    "<!DOCTYPE html>\n"
+    "<html>\n"
+    "<head>\n"
+    "<meta charset=\"UTF-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>ESP32-CAM 網路串流</title>\n"
+    "<style>\n"
+    "*{margin:0;padding:0;box-sizing:border-box}\n"
+    "body{background:#111;color:#eee;font-family:Arial,sans-serif;text-align:center}\n"
+    "h1{font-size:20px;padding:8px 0 2px;color:#e94560}\n"
+    "img{width:100%;max-width:640px;display:block;margin:0 auto;border-radius:6px}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>ESP32-CAM 網路串流</h1>\n"
+    "<img id=\"stream\" src=\"\">\n"
+    "<script>\n"
+    "var h=location.hostname;\n"
+    "document.getElementById('stream').src='http://'+h+':81/stream';\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>";
+
+    httpd_resp_set_type(req, "text/html"); // [cite: 17]
+    return httpd_resp_send(req, html, strlen(html)); // [cite: 17]
+}
+
+// ========== 啟動伺服器 ==========
+void start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80; // 網頁伺服器 Port [cite: 29]
+
+    httpd_uri_t index_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = index_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "啟動網頁伺服器於 Port: '%d'", config.server_port);
+    if (httpd_start(&page_httpd, &config) == ESP_OK) { // [cite: 30]
+        httpd_register_uri_handler(page_httpd, &index_uri); // [cite: 30]
+    }
+
+    // 啟動第二個伺服器專門處理影像串流 (Port 81)
+    config.server_port = 81; // [cite: 31]
+    config.ctrl_port += 1;   // 防止與 Port 80 控制埠衝突 [cite: 32]
+    
+    httpd_uri_t stream_uri = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "啟動串流伺服器於 Port: '%d'", config.server_port);
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) { // [cite: 33]
+        httpd_register_uri_handler(stream_httpd, &stream_uri); // [cite: 33]
+    }
+}
+
 // ===== 主程式進入點 =====
 void app_main(void)
 {
@@ -256,6 +372,6 @@ void app_main(void)
     // 3. 啟動攝影機
     ESP_ERROR_CHECK(init_camera());
 
-    // 4. 啟動 Web Server (將你 Arduino 中的 httpd_start 邏輯搬進來)
-    // start_webserver();
+    // 4. 啟動 Web Server 
+    start_webserver();
 }
