@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "station_example_main.c"
+    SRCS "MQTT_main.c" "station_example_main.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES 
         esp_wifi 
